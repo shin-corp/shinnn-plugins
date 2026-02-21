@@ -1,0 +1,1006 @@
+#!/usr/bin/env node
+'use strict';
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// --- Paths ---
+const CONFIG_DIR = path.join(process.env.HOME, '.claude-slack');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
+const LOG_FILE = path.join(CONFIG_DIR, 'debug.log');
+const LOG_MAX_SIZE = 1024 * 1024; // 1MB
+const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');
+
+// --- Reaction Emoji Sets ---
+const APPROVE_REACTIONS = new Set([
+  'white_check_mark', 'heavy_check_mark', 'thumbsup', '+1'
+]);
+const DENY_REACTIONS = new Set([
+  'x', 'no_entry', 'thumbsdown', '-1'
+]);
+
+// --- Debug Logging ---
+function rotateLogIfNeeded() {
+  try {
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > LOG_MAX_SIZE) {
+      const content = fs.readFileSync(LOG_FILE, 'utf8');
+      const half = content.slice(content.length >> 1);
+      const firstNewline = half.indexOf('\n');
+      fs.writeFileSync(LOG_FILE, firstNewline >= 0 ? half.slice(firstNewline + 1) : half);
+    }
+  } catch { /* ignore */ }
+}
+
+let _logRotated = false;
+
+function debugLog(msg) {
+  try {
+    if (!_logRotated) {
+      _logRotated = true;
+      rotateLogIfNeeded();
+    }
+    const ts = new Date().toISOString();
+    fs.appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`);
+  } catch { /* ignore */ }
+}
+
+// --- Utilities ---
+
+function findProjectLocalConfig() {
+  let dir = process.cwd();
+  const root = path.parse(dir).root;
+  while (true) {
+    const candidate = path.join(dir, '.claude', 'claude-slack.local.md');
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir || parent === root) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function parseYamlFrontmatter(content) {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return {};
+  const result = {};
+  for (const line of match[1].split('\n')) {
+    const kv = line.match(/^(\w+)\s*:\s*(.+)$/);
+    if (kv) {
+      let val = kv[2].trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (val === 'true') val = true;
+      else if (val === 'false') val = false;
+      else if (/^\d+$/.test(val)) val = parseInt(val, 10);
+      result[kv[1]] = val;
+    }
+  }
+  return result;
+}
+
+function loadConfig() {
+  // Layer 1: Global config (lowest priority)
+  let config = { _source: {} };
+  try {
+    const global = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    if (global.slack_bot_token) { config.slack_bot_token = global.slack_bot_token; config._source.slack_bot_token = 'global'; }
+    if (global.channel_id) { config.channel_id = global.channel_id; config._source.channel_id = 'global'; }
+    if (global.timeout) { config.timeout = global.timeout; config._source.timeout = 'global'; }
+    if (global.anthropic_api_key) { config.anthropic_api_key = global.anthropic_api_key; config._source.anthropic_api_key = 'global'; }
+  } catch { /* no global config */ }
+
+  // Layer 2: Project-local config (overrides global)
+  const localPath = findProjectLocalConfig();
+  if (localPath) {
+    try {
+      const content = fs.readFileSync(localPath, 'utf8');
+      const local = parseYamlFrontmatter(content);
+      if (local.slack_bot_token) { config.slack_bot_token = local.slack_bot_token; config._source.slack_bot_token = 'local'; }
+      if (local.channel_id) { config.channel_id = local.channel_id; config._source.channel_id = 'local'; }
+      if (local.timeout !== undefined) { config.timeout = local.timeout; config._source.timeout = 'local'; }
+      if (local.anthropic_api_key) { config.anthropic_api_key = local.anthropic_api_key; config._source.anthropic_api_key = 'local'; }
+      if (local.enabled !== undefined) { config._localEnabled = local.enabled; }
+      config._localPath = localPath;
+    } catch { /* ignore parse errors */ }
+  }
+
+  // Layer 3: Environment variables (highest priority)
+  if (process.env.CLAUDE_SLACK_TOKEN) { config.slack_bot_token = process.env.CLAUDE_SLACK_TOKEN; config._source.slack_bot_token = 'env'; }
+  if (process.env.CLAUDE_SLACK_CHANNEL) { config.channel_id = process.env.CLAUDE_SLACK_CHANNEL; config._source.channel_id = 'env'; }
+  if (process.env.CLAUDE_SLACK_TIMEOUT) { config.timeout = parseInt(process.env.CLAUDE_SLACK_TIMEOUT, 10); config._source.timeout = 'env'; }
+  if (process.env.ANTHROPIC_API_KEY) { config.anthropic_api_key = process.env.ANTHROPIC_API_KEY; config._source.anthropic_api_key = 'env'; }
+
+  if (!config.slack_bot_token && !config.channel_id) return null;
+  return config;
+}
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    return { enabled: false };
+  }
+}
+
+function isEnabled() {
+  // Env var overrides everything
+  if (process.env.CLAUDE_SLACK_ENABLED !== undefined) {
+    return process.env.CLAUDE_SLACK_ENABLED === 'true' || process.env.CLAUDE_SLACK_ENABLED === '1';
+  }
+  // Project-local overrides global
+  const config = loadConfig();
+  if (config?._localEnabled !== undefined) return config._localEnabled;
+  // Fall back to global state
+  const state = loadState();
+  return state.enabled;
+}
+
+function saveLocalConfig(config) {
+  const dir = path.join(process.cwd(), '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'claude-slack.local.md');
+
+  const lines = ['---'];
+  if (config.slack_bot_token) lines.push(`slack_bot_token: ${config.slack_bot_token}`);
+  if (config.channel_id) lines.push(`channel_id: ${config.channel_id}`);
+  if (config.timeout) lines.push(`timeout: ${config.timeout}`);
+  if (config.anthropic_api_key) lines.push(`anthropic_api_key: ${config.anthropic_api_key}`);
+  if (config.enabled !== undefined) lines.push(`enabled: ${config.enabled}`);
+  lines.push('---');
+  lines.push('');
+
+  fs.writeFileSync(filePath, lines.join('\n'));
+  fs.chmodSync(filePath, 0o600);
+}
+
+function saveState(state) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
+}
+
+function saveConfig(config) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
+  fs.chmodSync(CONFIG_FILE, 0o600);
+}
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', () => resolve(data));
+  });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// --- Input Validation ---
+
+function isValidPermissionRequest(input) {
+  if (!input || typeof input.tool_name !== 'string' || !input.tool_name) return false;
+  if (input.type === 'error' || input.error) return false;
+  if (input.tool_input && typeof input.tool_input !== 'object') return false;
+  if (input.tool_input?.type === 'error' || input.tool_input?.error) return false;
+  return true;
+}
+
+function isValidAskUserQuestion(input) {
+  if (!input || input.type === 'error' || input.error) return false;
+  const toolInput = input.tool_input || {};
+  if (!Array.isArray(toolInput.questions) || toolInput.questions.length === 0) return false;
+  return toolInput.questions.every(q => typeof q.question === 'string');
+}
+
+function isErrorMessage(message) {
+  if (!message || typeof message !== 'string') return false;
+  const errorPatterns = [
+    /API Error:/i,
+    /invalid_request_error/i,
+    /tool_use ids must be unique/i,
+    /internal_server_error/i,
+    /"type"\s*:\s*"error"/,
+    /rate_limit_error/i,
+  ];
+  return errorPatterns.some(p => p.test(message));
+}
+
+// --- Concurrency Lock ---
+
+function acquireLock(lockName, maxAgeMs = 120000) {
+  const lockPath = LOCK_FILE + '.' + lockName;
+  try {
+    if (fs.existsSync(lockPath)) {
+      const stat = fs.statSync(lockPath);
+      const ageMs = Date.now() - stat.mtimeMs;
+      if (ageMs < maxAgeMs) {
+        return false;
+      }
+      fs.unlinkSync(lockPath);
+    }
+    fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseLock(lockName) {
+  const lockPath = LOCK_FILE + '.' + lockName;
+  try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+}
+
+function truncate(str, max) {
+  if (!str) return '';
+  return str.length > max ? str.slice(0, max - 3) + '...' : str;
+}
+
+function getProjectContext() {
+  const parts = [];
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    if (branch) parts.push(`Branch: \`${branch}\``);
+  } catch { /* not a git repo */ }
+  parts.push(`Project: \`${path.basename(process.cwd())}\``);
+  return parts;
+}
+
+function getRecentTranscript(transcriptPath, maxLines = 30) {
+  try {
+    if (!transcriptPath) return '';
+    const content = fs.readFileSync(transcriptPath, 'utf8');
+    const lines = content.trim().split('\n').slice(-maxLines);
+    const parts = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === 'text' && block.text) {
+              parts.push(`[Assistant] ${block.text.slice(0, 200)}`);
+            } else if (block.type === 'tool_use') {
+              const inp = JSON.stringify(block.input || {}).slice(0, 150);
+              parts.push(`[Tool] ${block.name}: ${inp}`);
+            }
+          }
+        } else if (entry.type === 'human' && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === 'text' && block.text) {
+              parts.push(`[User] ${block.text.slice(0, 200)}`);
+            }
+          }
+        }
+      } catch { /* skip unparseable lines */ }
+    }
+    return parts.slice(-10).join('\n');
+  } catch (e) {
+    debugLog(`getRecentTranscript: error: ${e.message}`);
+    return '';
+  }
+}
+
+function callAnthropic(apiKey, prompt, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const req = https.request({
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.setEncoding('utf8');
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed.content?.[0]?.text || '';
+          resolve(text);
+        } catch { resolve(''); }
+      });
+    });
+    req.on('error', () => resolve(''));
+    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(''); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function generateSummary(config, toolName, toolInput, transcriptPath) {
+  if (!config.anthropic_api_key) return '';
+  const context = getRecentTranscript(transcriptPath);
+  const toolDesc = toolInput.description ? `\nDescription: ${toolInput.description}` : '';
+  const inputSummary = JSON.stringify(toolInput, null, 2).slice(0, 1000);
+
+  const prompt = `You are summarizing a Claude Code operation for a human reviewer on Slack.
+Reply in Japanese, one sentence only, max 100 characters. No markdown.
+
+Tool: ${toolName}${toolDesc}
+Input: ${inputSummary}
+${context ? `\nRecent conversation:\n${context}` : ''}
+
+What is Claude trying to do and why? Reply in one concise sentence in Japanese.`;
+
+  debugLog('generateSummary: calling Anthropic API');
+  const summary = await callAnthropic(config.anthropic_api_key, prompt);
+  debugLog(`generateSummary: result="${summary.slice(0, 100)}"`);
+  return summary.trim();
+}
+
+// --- Slack API ---
+
+function slackRequestOnce(method, token, params, httpMethod = 'POST') {
+  return new Promise((resolve, reject) => {
+    let reqOptions;
+    let body = null;
+
+    if (httpMethod === 'GET') {
+      const qs = new URLSearchParams(params).toString();
+      reqOptions = {
+        hostname: 'slack.com',
+        path: `/api/${method}?${qs}`,
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${token}` },
+      };
+    } else {
+      body = JSON.stringify(params);
+      reqOptions = {
+        hostname: 'slack.com',
+        path: `/api/${method}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Authorization': `Bearer ${token}`,
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
+    }
+
+    const req = https.request(reqOptions, (res) => {
+      let responseData = '';
+      res.on('data', (chunk) => { responseData += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(responseData);
+          if (res.statusCode === 429) {
+            const retryAfter = parseInt(res.headers['retry-after'] || '10', 10);
+            resolve({ _rateLimited: true, retryAfter });
+          } else {
+            resolve(parsed);
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse Slack response: ${e.message}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function slackRequest(method, token, params, httpMethod = 'POST') {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await slackRequestOnce(method, token, params, httpMethod);
+    if (result._rateLimited) {
+      await sleep(result.retryAfter * 1000);
+      continue;
+    }
+    return result;
+  }
+  throw new Error(`Slack API rate limited after 3 retries`);
+}
+
+async function postMessage(token, channel, text, blocks) {
+  const payload = { channel, text };
+  if (blocks) payload.blocks = blocks;
+  const result = await slackRequest('chat.postMessage', token, payload);
+  if (!result.ok) throw new Error(`Slack postMessage error: ${result.error}`);
+  return result;
+}
+
+async function getThreadReplies(token, channel, ts) {
+  const result = await slackRequest('conversations.replies', token, {
+    channel, ts, limit: '10'
+  }, 'GET');
+  if (!result.ok) throw new Error(`Slack conversations.replies error: ${result.error}`);
+  return result.messages || [];
+}
+
+async function getReactions(token, channel, ts) {
+  const result = await slackRequest('reactions.get', token, {
+    channel, timestamp: ts, full: 'true'
+  }, 'GET');
+  if (!result.ok) {
+    debugLog(`getReactions: error: ${result.error}`);
+    return [];
+  }
+  return (result.message && result.message.reactions) || [];
+}
+
+async function pollForReply(token, channel, ts, timeoutMs = 300000) {
+  const startTime = Date.now();
+  let interval = 5000;
+  let pollCount = 0;
+
+  debugLog(`pollForReply: start polling ts=${ts} timeout=${timeoutMs}ms`);
+
+  while (Date.now() - startTime < timeoutMs) {
+    await sleep(interval);
+    pollCount++;
+
+    try {
+      const messages = await getThreadReplies(token, channel, ts);
+      const replies = messages.filter(m => m.ts !== ts && !m.bot_id);
+      debugLog(`pollForReply: poll #${pollCount} - ${messages.length} messages, ${replies.length} human replies`);
+      if (replies.length > 0) {
+        const replyText = replies[replies.length - 1].text;
+        debugLog(`pollForReply: got reply: "${replyText}"`);
+        return replyText;
+      }
+    } catch (e) {
+      debugLog(`pollForReply: poll #${pollCount} error: ${e.message}`);
+    }
+
+    if (Date.now() - startTime > 60000 && interval < 10000) {
+      interval = 10000;
+    }
+  }
+
+  debugLog(`pollForReply: timed out after ${pollCount} polls`);
+  return null;
+}
+
+async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
+  const startTime = Date.now();
+  let interval = 5000;
+  let pollCount = 0;
+
+  debugLog(`pollForApproval: start polling ts=${ts} timeout=${timeoutMs}ms`);
+
+  while (Date.now() - startTime < timeoutMs) {
+    await sleep(interval);
+    pollCount++;
+
+    // Check reactions (every cycle - Tier 2+ rate limit)
+    try {
+      const reactions = await getReactions(token, channel, ts);
+      for (const r of reactions) {
+        if (APPROVE_REACTIONS.has(r.name)) {
+          debugLog(`pollForApproval: approved via reaction :${r.name}: (count=${r.count})`);
+          return { decision: 'allow', source: 'reaction', detail: r.name };
+        }
+        if (DENY_REACTIONS.has(r.name)) {
+          debugLog(`pollForApproval: denied via reaction :${r.name}: (count=${r.count})`);
+          return { decision: 'deny', source: 'reaction', detail: r.name };
+        }
+      }
+    } catch (e) {
+      debugLog(`pollForApproval: reaction check #${pollCount} error: ${e.message}`);
+    }
+
+    // Check thread replies (every 3rd cycle - Tier 1 rate limit)
+    if (pollCount % 3 === 0) {
+      try {
+        const messages = await getThreadReplies(token, channel, ts);
+        const replies = messages.filter(m => m.ts !== ts && !m.bot_id);
+        debugLog(`pollForApproval: thread check #${pollCount} - ${replies.length} human replies`);
+        if (replies.length > 0) {
+          const replyText = replies[replies.length - 1].text;
+          const replyLower = replyText.toLowerCase().trim();
+          const isApproved = /^(approve|allow|yes|y|ok)/.test(replyLower);
+          const decision = isApproved ? 'allow' : 'deny';
+          debugLog(`pollForApproval: ${decision} via thread reply: "${replyText}"`);
+          return { decision, source: 'thread', detail: replyText };
+        }
+      } catch (e) {
+        debugLog(`pollForApproval: thread check #${pollCount} error: ${e.message}`);
+      }
+    }
+
+    if (Date.now() - startTime > 60000 && interval < 10000) {
+      interval = 10000;
+    }
+  }
+
+  debugLog(`pollForApproval: timed out after ${pollCount} polls`);
+  return null;
+}
+
+// --- Hook Handlers ---
+
+async function hookPermissionRequest() {
+  debugLog('hookPermissionRequest: start');
+  if (!isEnabled()) { debugLog('hookPermissionRequest: disabled, exit'); process.exit(0); }
+
+  const config = loadConfig();
+  if (!config?.slack_bot_token || !config?.channel_id) { debugLog('hookPermissionRequest: no config, exit'); process.exit(0); }
+
+  let input;
+  try {
+    const raw = await readStdin();
+    debugLog(`hookPermissionRequest: stdin length=${raw.length}`);
+    input = JSON.parse(raw);
+  } catch (e) {
+    debugLog(`hookPermissionRequest: stdin parse error: ${e.message}`);
+    process.exit(0);
+  }
+
+  if (!isValidPermissionRequest(input)) {
+    debugLog(`hookPermissionRequest: REJECTED invalid input: ${JSON.stringify(input).slice(0, 200)}`);
+    process.exit(0);
+  }
+
+  if (!acquireLock('permission')) {
+    debugLog('hookPermissionRequest: SKIPPED - another permission request is already active');
+    process.exit(0);
+  }
+
+  const toolName = input.tool_name || 'unknown';
+  const toolInput = input.tool_input || {};
+  const sessionId = input.session_id || 'unknown';
+
+  let details = '';
+  let warn = '';
+  if (toolName === 'Bash') {
+    const cmd = toolInput.command || '';
+    const dangerPatterns = [
+      /rm\s+(-[^\s]*r|--recursive)/, /sudo\s/, /chmod\s+777/,
+      /git\s+(push\s+(-f|--force)|reset\s+--hard|clean\s+-f)/,
+      /DROP\s+(TABLE|DATABASE)/i, /curl.*\|\s*(ba)?sh/,
+      /mkfs\./, /dd\s+if=/
+    ];
+    if (dangerPatterns.some(p => p.test(cmd))) warn = ':rotating_light: ';
+    details = `${warn}*Command:*\n\`\`\`${truncate(cmd, 2500)}\`\`\``;
+    if (toolInput.description) {
+      details += `\n*Description:* ${truncate(toolInput.description, 200)}`;
+    }
+  } else if (toolName === 'Write') {
+    const content = toolInput.content || '';
+    const lines = content.split('\n');
+    details = `*File:* \`${toolInput.file_path || ''}\`\n*Size:* ${content.length} chars, ${lines.length} lines`;
+    const preview = lines.slice(0, 10).join('\n');
+    if (preview) {
+      details += `\n*Preview:*\n\`\`\`${truncate(preview, 500)}\`\`\``;
+    }
+    if (lines.length > 10) details += `\n_...and ${lines.length - 10} more lines_`;
+  } else if (toolName === 'Edit') {
+    details = `*File:* \`${toolInput.file_path || ''}\``;
+    if (toolInput.old_string) {
+      details += `\n*Replace:*\n\`\`\`${truncate(toolInput.old_string, 800)}\`\`\``;
+    }
+    if (toolInput.new_string) {
+      details += `\n*With:*\n\`\`\`${truncate(toolInput.new_string, 800)}\`\`\``;
+    }
+    if (toolInput.replace_all) details += `\n:warning: *replace_all: true*`;
+  } else {
+    const inputStr = JSON.stringify(toolInput, null, 2);
+    details = `\`\`\`${truncate(inputStr, 2500)}\`\`\``;
+  }
+
+  // AI summary (optional - requires anthropic_api_key)
+  const summary = await generateSummary(config, toolName, toolInput, input.transcript_path);
+
+  const contextElements = [
+    { type: 'mrkdwn', text: `Session: \`${sessionId.slice(0, 8)}\`` },
+    ...getProjectContext().map(text => ({ type: 'mrkdwn', text }))
+  ];
+
+  const blocks = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: truncate(`${warn}Permission: ${toolName}`, 150), emoji: true }
+    },
+    ...(summary ? [{
+      type: 'section',
+      text: { type: 'mrkdwn', text: `💡 ${summary}` }
+    }] : []),
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: truncate(details, 3000) }
+    },
+    {
+      type: 'context',
+      elements: contextElements
+    },
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: '✅ React to approve, ❌ to deny  —  or reply: *approve* / *deny*' }
+    }
+  ];
+
+  try {
+    const result = await postMessage(
+      config.slack_bot_token, config.channel_id,
+      `Permission Request: ${toolName}`, blocks
+    );
+
+    const approval = await pollForApproval(
+      config.slack_bot_token, config.channel_id,
+      result.ts, (config.timeout || 300) * 1000
+    );
+
+    if (!approval) {
+      debugLog('hookPermissionRequest: timed out, falling back to local prompt');
+      process.exit(0);
+    }
+
+    const decision = approval.decision;
+    debugLog(`hookPermissionRequest: decision=${decision} source=${approval.source} detail="${approval.detail}"`);
+
+    const output = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        decision: { behavior: decision }
+      }
+    });
+    debugLog(`hookPermissionRequest: output=${output}`);
+    console.log(output);
+  } catch (e) {
+    debugLog(`hookPermissionRequest: error: ${e.message}`);
+  } finally {
+    releaseLock('permission');
+  }
+}
+
+async function hookAskUserQuestion() {
+  debugLog('hookAskUserQuestion: start');
+  if (!isEnabled()) { debugLog('hookAskUserQuestion: disabled, exit'); process.exit(0); }
+
+  const config = loadConfig();
+  if (!config?.slack_bot_token || !config?.channel_id) { debugLog('hookAskUserQuestion: no config, exit'); process.exit(0); }
+
+  let input;
+  try {
+    const raw = await readStdin();
+    debugLog(`hookAskUserQuestion: stdin length=${raw.length}`);
+    input = JSON.parse(raw);
+  } catch (e) {
+    debugLog(`hookAskUserQuestion: stdin parse error: ${e.message}`);
+    process.exit(0);
+  }
+
+  if (!isValidAskUserQuestion(input)) {
+    debugLog(`hookAskUserQuestion: REJECTED invalid input: ${JSON.stringify(input).slice(0, 200)}`);
+    process.exit(0);
+  }
+
+  if (!acquireLock('question')) {
+    debugLog('hookAskUserQuestion: SKIPPED - another question is already active');
+    process.exit(0);
+  }
+
+  const toolInput = input.tool_input || {};
+  const sessionId = input.session_id || 'unknown';
+  const questions = toolInput.questions || [];
+
+  let questionText = '';
+  for (const q of questions) {
+    questionText += `*${q.question}*\n`;
+    if (q.options?.length > 0) {
+      q.options.forEach((opt, i) => {
+        questionText += `  ${i + 1}. *${opt.label}*`;
+        if (opt.description) questionText += ` - ${opt.description}`;
+        questionText += '\n';
+      });
+    }
+    if (q.multiSelect) {
+      questionText += `_(multiple selection allowed)_\n`;
+    }
+    questionText += '\n';
+  }
+
+  const blocks = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: '❓ Claude needs your input', emoji: true }
+    },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: truncate(questionText, 3000) }
+    },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `Session: \`${sessionId.slice(0, 8)}\`` }]
+    },
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: '💬 Reply in thread with a number or text' }
+    }
+  ];
+
+  try {
+    const result = await postMessage(
+      config.slack_bot_token, config.channel_id,
+      '❓ Claude needs your input', blocks
+    );
+
+    const reply = await pollForReply(
+      config.slack_bot_token, config.channel_id,
+      result.ts, (config.timeout || 300) * 1000
+    );
+
+    if (!reply) {
+      debugLog('hookAskUserQuestion: timed out, falling back to local prompt');
+      process.exit(0);
+    }
+
+    let answer = reply.trim();
+    const num = parseInt(answer, 10);
+    if (!isNaN(num) && questions[0]?.options) {
+      const opt = questions[0].options[num - 1];
+      if (opt) answer = opt.label;
+    }
+
+    debugLog(`hookAskUserQuestion: reply="${reply}" answer="${answer}"`);
+
+    const output = JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'The user has already answered this question via Slack. Their answer is provided in the additional context. Do not ask this question again - proceed with the provided answer.',
+        additionalContext: `User answered via Slack: ${answer}`
+      }
+    });
+    debugLog(`hookAskUserQuestion: output=${output}`);
+    console.log(output);
+  } catch (e) {
+    debugLog(`hookAskUserQuestion: error: ${e.message}`);
+  } finally {
+    releaseLock('question');
+  }
+}
+
+async function hookNotification() {
+  debugLog('hookNotification: start');
+  if (!isEnabled()) { debugLog('hookNotification: disabled, exit'); process.exit(0); }
+
+  const config = loadConfig();
+  if (!config?.slack_bot_token || !config?.channel_id) { debugLog('hookNotification: no config, exit'); process.exit(0); }
+
+  let input;
+  try {
+    const raw = await readStdin();
+    debugLog(`hookNotification: stdin length=${raw.length}`);
+    input = JSON.parse(raw);
+  } catch (e) {
+    debugLog(`hookNotification: stdin parse error: ${e?.message}`);
+    process.exit(0);
+  }
+
+  if (input.type === 'error' || input.error) {
+    debugLog(`hookNotification: REJECTED error object: ${JSON.stringify(input).slice(0, 200)}`);
+    process.exit(0);
+  }
+
+  const sessionId = input.session_id || 'unknown';
+  const message = input.message || 'Claude Code is waiting for input';
+
+  if (isErrorMessage(message)) {
+    debugLog(`hookNotification: REJECTED error message: ${message.slice(0, 200)}`);
+    process.exit(0);
+  }
+
+  debugLog(`hookNotification: posting message: ${message.slice(0, 100)}`);
+
+  try {
+    await postMessage(
+      config.slack_bot_token, config.channel_id,
+      `⏳ ${message}`,
+      [{
+        type: 'section',
+        text: { type: 'mrkdwn', text: `⏳ *Claude Code is idle and waiting for your input*\n${truncate(message, 2500)}` }
+      }, {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `Session: \`${sessionId.slice(0, 8)}\`` }]
+      }]
+    );
+    debugLog('hookNotification: posted successfully');
+  } catch (e) {
+    debugLog(`hookNotification: error: ${e?.message}`);
+  }
+
+  process.exit(0);
+}
+
+// --- CLI Commands ---
+
+async function cmdEnable(args) {
+  const isLocal = args.includes('--local');
+  if (isLocal) {
+    const config = loadConfig() || {};
+    saveLocalConfig({ ...config, enabled: true });
+    console.log('claude-slack: ENABLED (project-local)');
+  } else {
+    saveState({ enabled: true });
+    console.log('claude-slack: ENABLED (global)');
+  }
+}
+
+async function cmdDisable(args) {
+  const isLocal = args.includes('--local');
+  if (isLocal) {
+    const config = loadConfig() || {};
+    saveLocalConfig({ ...config, enabled: false });
+    console.log('claude-slack: DISABLED (project-local)');
+  } else {
+    saveState({ enabled: false });
+    console.log('claude-slack: DISABLED (global)');
+  }
+}
+
+async function cmdConfig(args) {
+  const isLocal = args.includes('--local');
+  const filteredArgs = args.filter(a => a !== '--local');
+  const config = {};
+
+  for (let i = 0; i < filteredArgs.length; i++) {
+    if (filteredArgs[i] === '--token' && filteredArgs[i + 1]) {
+      config.slack_bot_token = filteredArgs[++i];
+    } else if (filteredArgs[i] === '--channel' && filteredArgs[i + 1]) {
+      config.channel_id = filteredArgs[++i];
+    } else if (filteredArgs[i] === '--timeout' && filteredArgs[i + 1]) {
+      config.timeout = parseInt(filteredArgs[++i], 10);
+    } else if (filteredArgs[i] === '--anthropic-key' && filteredArgs[i + 1]) {
+      config.anthropic_api_key = filteredArgs[++i];
+    }
+  }
+
+  if (!config.slack_bot_token && !config.channel_id && !config.anthropic_api_key) {
+    console.log('Usage: claude-slack config [--local] --token <xoxb-...> --channel <C...> [options]');
+    console.log('');
+    console.log('Required:');
+    console.log('  --token          Slack Bot User OAuth Token (starts with xoxb-)');
+    console.log('  --channel        Slack Channel ID (starts with C)');
+    console.log('');
+    console.log('Optional:');
+    console.log('  --timeout        Reply timeout in seconds (default: 300)');
+    console.log('  --anthropic-key  Anthropic API Key for AI summary (sk-ant-...)');
+    console.log('  --local          Save to project-local .claude/claude-slack.local.md');
+    console.log('');
+    console.log('Environment variables (highest priority):');
+    console.log('  CLAUDE_SLACK_TOKEN    Slack Bot Token');
+    console.log('  CLAUDE_SLACK_CHANNEL  Channel ID');
+    console.log('  CLAUDE_SLACK_TIMEOUT  Timeout in seconds');
+    console.log('  CLAUDE_SLACK_ENABLED  Enable/disable (true/false)');
+    console.log('  ANTHROPIC_API_KEY     Anthropic API Key for AI summary');
+    return;
+  }
+
+  if (isLocal) {
+    saveLocalConfig(config);
+    console.log('Configuration saved to .claude/claude-slack.local.md');
+  } else {
+    // Merge with existing global config
+    const existing = loadConfig() || {};
+    const merged = { ...existing, ...config };
+    delete merged._source;
+    delete merged._localEnabled;
+    delete merged._localPath;
+    saveConfig(merged);
+    console.log('Configuration saved to ~/.claude-slack/config.json');
+  }
+  console.log(`  Channel:  ${config.channel_id || '(not set)'}`);
+  console.log(`  Token:    ${config.slack_bot_token ? config.slack_bot_token.slice(0, 12) + '****' : '(not set)'}`);
+  console.log(`  Timeout:  ${config.timeout || 300}s`);
+}
+
+async function cmdTest() {
+  const config = loadConfig();
+  if (!config?.slack_bot_token || !config?.channel_id) {
+    console.error('Error: Configuration not found.');
+    console.error('Run: claude-slack config --token <xoxb-...> --channel <C...>');
+    process.exit(1);
+  }
+
+  console.log('Testing Slack connection...');
+  try {
+    const result = await postMessage(
+      config.slack_bot_token, config.channel_id,
+      '🧪 claude-slack connection test',
+      [{
+        type: 'section',
+        text: { type: 'mrkdwn', text: '🧪 *claude-slack connection test*\nThis message confirms the integration is working.' }
+      }]
+    );
+    console.log(`SUCCESS: Test message posted (ts: ${result.ts})`);
+    console.log(`Channel: ${config.channel_id}`);
+  } catch (e) {
+    console.error(`FAILED: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+async function cmdStatus() {
+  const enabled = isEnabled();
+  const config = loadConfig();
+
+  // Determine enabled source
+  let enabledSource = 'global';
+  if (process.env.CLAUDE_SLACK_ENABLED !== undefined) enabledSource = 'env';
+  else if (config?._localEnabled !== undefined) enabledSource = 'local';
+
+  console.log('=== claude-slack status ===');
+  console.log(`State:    ${enabled ? 'ENABLED' : 'DISABLED'} (source: ${enabledSource})`);
+  if (config) {
+    const src = config._source || {};
+    console.log(`Channel:  ${config.channel_id || '(not set)'}${src.channel_id ? ` (source: ${src.channel_id})` : ''}`);
+    console.log(`Token:    ${config.slack_bot_token ? config.slack_bot_token.slice(0, 12) + '****' : '(not set)'}${src.slack_bot_token ? ` (source: ${src.slack_bot_token})` : ''}`);
+    console.log(`Timeout:  ${config.timeout || 300}s${src.timeout ? ` (source: ${src.timeout})` : ''}`);
+    console.log(`AI:       ${config.anthropic_api_key ? 'ENABLED' : 'OFF'}${src.anthropic_api_key ? ` (source: ${src.anthropic_api_key})` : ''}`);
+    if (config._localPath) {
+      console.log(`Local:    ${config._localPath}`);
+    }
+  } else {
+    console.log('Config:   Not configured');
+    console.log('  Run: claude-slack config --token <xoxb-...> --channel <C...>');
+  }
+}
+
+// --- Main ---
+
+async function main() {
+  const args = process.argv.slice(2);
+  const command = args[0];
+
+  try {
+    switch (command) {
+      case 'hook':
+        switch (args[1]) {
+          case 'permission-request': await hookPermissionRequest(); break;
+          case 'ask-user-question':  await hookAskUserQuestion(); break;
+          case 'notification':       await hookNotification(); break;
+          default:
+            console.error(`Unknown hook: ${args[1]}`);
+            process.exit(1);
+        }
+        break;
+      case 'enable':    await cmdEnable(args.slice(1)); break;
+      case 'disable':   await cmdDisable(args.slice(1)); break;
+      case 'config':    await cmdConfig(args.slice(1)); break;
+      case 'test':      await cmdTest(); break;
+      case 'status':    await cmdStatus(); break;
+      default:
+        console.log('claude-slack - Route Claude Code approvals and questions to Slack');
+        console.log('');
+        console.log('Usage: claude-slack <command>');
+        console.log('');
+        console.log('Configuration:');
+        console.log('  config           Set Slack token, channel, and timeout (global)');
+        console.log('  config --local   Save config to current project');
+        console.log('  test             Test Slack connection');
+        console.log('');
+        console.log('Control:');
+        console.log('  enable           Enable Slack routing (global)');
+        console.log('  enable --local   Enable for current project only');
+        console.log('  disable          Disable Slack routing (global)');
+        console.log('  disable --local  Disable for current project only');
+        console.log('  status           Show current configuration and sources');
+        break;
+    }
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+main();

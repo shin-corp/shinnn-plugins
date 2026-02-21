@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack hook permission-request",
+            "timeout": 600,
+            "statusMessage": "Waiting for Slack approval..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack hook ask-user-question",
+            "timeout": 600,
+            "statusMessage": "Waiting for Slack response..."
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack hook notification",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

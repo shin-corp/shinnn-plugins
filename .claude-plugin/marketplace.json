@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-code-plugins",
+  "owner": {
+    "name": "shinnn, Inc."
+  },
+  "plugins": [
+    {
+      "name": "claude-slack",
+      "source": "./plugins/claude-slack",
+      "description": "Route Claude Code permission requests, questions, and notifications to Slack",
+      "version": "1.0.0",
+      "author": {
+        "name": "shinnn, Inc."
+      },
+      "repository": "https://github.com/shin-corp/claude-code-plugins",
+      "license": "MIT"
+    }
+  ]
+}

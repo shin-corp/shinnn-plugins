@@ -1,0 +1,10 @@
+{
+  "name": "claude-slack",
+  "version": "1.0.0",
+  "description": "Route Claude Code permission requests, questions, and notifications to Slack",
+  "license": "MIT",
+  "author": "shinnn",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

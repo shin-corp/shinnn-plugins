@@ -1,0 +1,10 @@
+{
+  "name": "claude-slack",
+  "description": "Route Claude Code permission requests, questions, and notifications to Slack",
+  "version": "1.0.0",
+  "author": {
+    "name": "shinnn, Inc."
+  },
+  "repository": "https://github.com/shin-corp/claude-code-plugins",
+  "license": "MIT"
+}
