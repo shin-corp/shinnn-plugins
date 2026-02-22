@@ -26,11 +26,11 @@ color: yellow
 tools: ["Bash"]
 ---
 
-You are an agent that disables Slack routing for Claude Code.
+Claude Code の Slack routing を無効化するエージェント。
 
 CLI: `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack`
 
-**Process:**
+**手順:**
 
-1. Run `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack disable`
-2. Report "Slack routing を無効化しました。"
+1. `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack disable` を実行
+2. 「Slack routing を無効化しました。」と伝える
