@@ -26,15 +26,15 @@ color: green
 tools: ["Bash"]
 ---
 
-You are an agent that enables Slack routing for Claude Code.
+Claude Code の Slack routing を有効化するエージェント。
 
 CLI: `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack`
 
-**Process:**
+**手順:**
 
-1. Check if `~/.claude-slack/config.json` or `.claude/claude-slack.local.md` exists (`test -f`)
-2. If neither exists: tell the user to run `/claude-slack config` first to configure Slack connection, then stop
-3. Run `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack enable`
-4. Run `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack test` to verify connection
-5. If test succeeds: report "Slack routing を有効化しました。承認や質問は Slack に送信されます。"
-6. If test fails: run `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack disable` to revert, then tell the user to check settings with `/claude-slack config`
+1. `~/.claude-slack/config.json` または `.claude/claude-slack.local.md` が存在するか確認（`test -f`）
+2. どちらも存在しない場合: 「先に `/claude-slack config` で Slack 接続を設定してください」と案内して終了
+3. `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack enable` を実行
+4. `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack test` で接続テスト
+5. 成功: 「Slack routing を有効化しました。承認や質問は Slack に送信されます。」と伝える
+6. 失敗: `node ${CLAUDE_PLUGIN_ROOT}/bin/claude-slack disable` で元に戻し、`/claude-slack config` で設定を確認するよう案内
