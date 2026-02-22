@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-code-plugins",
+  "name": "shinnn-plugins",
   "owner": {
     "name": "shinnn, Inc."
   },
@@ -13,7 +13,7 @@
       "author": {
         "name": "shinnn, Inc."
       },
-      "repository": "https://github.com/shin-corp/claude-code-plugins",
+      "repository": "https://github.com/shin-corp/shinnn-plugins",
       "license": "MIT"
     }
   ]

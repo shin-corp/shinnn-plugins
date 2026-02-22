@@ -1,11 +1,11 @@
-# claude-code-plugins
+# shinnn-plugins
 
 Claude Code plugin marketplace by shinnn, Inc.
 
 ## Install
 
 ```
-/plugin marketplace add shin-corp/claude-code-plugins
+/plugin marketplace add shin-corp/shinnn-plugins
 ```
 
 ## Plugins

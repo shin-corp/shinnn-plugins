@@ -39,10 +39,10 @@ Claude Code がツール実行の承認や質問を必要とするとき、タ�
 
 ```
 # 1. マーケットプレイスを追加
-/plugin marketplace add shin-corp/claude-code-plugins
+/plugin marketplace add shin-corp/shinnn-plugins
 
 # 2. プラグインをインストール
-/plugin install claude-slack@claude-code-plugins
+/plugin install claude-slack@shinnn-plugins
 ```
 
 インストール後、Claude Code を再起動してください。

@@ -39,10 +39,10 @@ Three hook types are supported:
 
 ```
 # 1. Add the marketplace
-/plugin marketplace add shin-corp/claude-code-plugins
+/plugin marketplace add shin-corp/shinnn-plugins
 
 # 2. Install the plugin
-/plugin install claude-slack@claude-code-plugins
+/plugin install claude-slack@shinnn-plugins
 ```
 
 Restart Claude Code after installation.
