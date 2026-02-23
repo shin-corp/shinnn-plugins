@@ -29,11 +29,17 @@ const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');        // 同時実行防�
 
 // --- シグナルハンドラ ---
 // Claude Code がターミナルで応答を受けるとフックプロセスに SIGTERM/SIGINT を送る。
-// プロセス終了前にロックファイルを削除して、次回の実行がブロックされないようにする。
+// プロセス終了前に「自分が保持している」ロックファイルのみ削除する。
+// 待機中のプロセスが kill された場合、アクティブなプロセスのロックを消さないようにする。
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => {
-    try { fs.unlinkSync(LOCK_FILE + '.permission'); } catch {}
-    try { fs.unlinkSync(LOCK_FILE + '.question'); } catch {}
+    for (const lockName of ['permission', 'question']) {
+      const lockPath = LOCK_FILE + '.' + lockName;
+      try {
+        const pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+        if (pid === process.pid) fs.unlinkSync(lockPath);
+      } catch {}
+    }
     process.exit(0);
   });
 }
@@ -45,6 +51,9 @@ const APPROVE_REACTIONS = new Set([
 ]);
 const DENY_REACTIONS = new Set([
   'x', 'no_entry', 'thumbsdown', '-1'                        // ❌👎 = 拒否
+]);
+const ALWAYS_REACTIONS = new Set([
+  'rocket', 'repeat', 'infinity'                              // 🚀🔁♾️ = 常に許可
 ]);
 
 // --- デバッグログ ---
@@ -299,32 +308,31 @@ function isErrorMessage(message) {
  * 名前付きロックを取得する。同じ種類のフック（permission/question）が同時に動かないよう制御。
  *
  * 動作:
- *   1. 既存のロックファイルがある場合、経過時間を確認
- *   2. maxAgeMs 以内なら前のプロセスを SIGTERM で停止して引き継ぐ
- *   3. ロックファイルを排他モード ('wx') で作成し、自分の PID を書き込む
+ *   1. 既存のロックファイルがある場合、保持プロセスの生存を確認
+ *   2. プロセスが生きていれば取得失敗（呼び出し元のリトライに任せる）
+ *   3. プロセスが死んでいればロックを掃除して取得
  *
- * 注意: existsSync → unlinkSync → writeFileSync の間にわずかなレースコンディションの可能性があるが、
- *       同一ユーザーのローカル環境での使用を前提としているため実用上問題ない。
+ * 前のプロセスを kill しない設計: kill すると Slack メッセージが孤立する。
+ * 待機リトライ方式で順番に処理することで、承認の消失を防ぐ。
  *
  * @param {string} lockName - ロック名（'permission' または 'question'）
- * @param {number} maxAgeMs - ロックの最大有効期間（デフォルト: 2分）
  * @returns {boolean} ロック取得に成功したら true
  */
-function acquireLock(lockName, maxAgeMs = 120000) {
+function acquireLock(lockName) {
   const lockPath = LOCK_FILE + '.' + lockName;
   try {
     if (fs.existsSync(lockPath)) {
-      const stat = fs.statSync(lockPath);
-      const ageMs = Date.now() - stat.mtimeMs;
-      if (ageMs < maxAgeMs) {
-        // 前のプロセスが残っていれば終了させて引き継ぐ
-        try {
-          const oldPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
-          if (oldPid && oldPid !== process.pid) {
-            process.kill(oldPid, 'SIGTERM');
-            debugLog(`acquireLock: killed stale process ${oldPid} for ${lockName}`);
-          }
-        } catch { /* プロセスが既に終了している場合は無視 */ }
+      // ロック保持者の生存を確認
+      try {
+        const oldPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+        if (oldPid && oldPid !== process.pid) {
+          process.kill(oldPid, 0); // シグナル 0 = 存在確認のみ（kill しない）
+          // プロセスが生きている → ロック取得せず待機に任せる
+          return false;
+        }
+      } catch {
+        // プロセスが死んでいるか PID 読み取り不可 → ロックを掃除して取得
+        debugLog(`acquireLock: cleaning up stale lock for ${lockName}`);
       }
       fs.unlinkSync(lockPath);
     }
@@ -724,6 +732,10 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
           debugLog(`pollForApproval: denied via reaction :${r.name}: (count=${r.count})`);
           return { decision: 'deny', source: 'reaction', detail: r.name };
         }
+        if (ALWAYS_REACTIONS.has(r.name)) {
+          debugLog(`pollForApproval: always-allow via reaction :${r.name}: (count=${r.count})`);
+          return { decision: 'allowAlways', source: 'reaction', detail: r.name };
+        }
       }
     } catch (e) {
       debugLog(`pollForApproval: reaction check #${pollCount} error: ${e.message}`);
@@ -738,6 +750,12 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
         if (replies.length > 0) {
           const replyText = replies[replies.length - 1].text;
           const replyLower = replyText.toLowerCase().trim();
+          // "always" で始まれば常に許可
+          const isAlways = /^always/.test(replyLower);
+          if (isAlways) {
+            debugLog(`pollForApproval: always-allow via thread reply: "${replyText}"`);
+            return { decision: 'allowAlways', source: 'thread', detail: replyText };
+          }
           // "approve", "allow", "yes", "y", "ok" で始まれば承認、それ以外は拒否
           const isApproved = /^(approve|allow|yes|y|ok)/.test(replyLower);
           const decision = isApproved ? 'allow' : 'deny';
@@ -757,6 +775,17 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
 
   debugLog(`pollForApproval: timed out after ${pollCount} polls`);
   return null;
+}
+
+/**
+ * ツール名と入力からパーミッションルール文字列を生成する。
+ * updatedPermissions に渡す形式で、.claude/settings.json と同じ書式。
+ */
+function buildPermissionRule(toolName, toolInput) {
+  if (toolName === 'Bash' && toolInput.command) return `Bash(${toolInput.command})`;
+  if (toolName === 'Edit' && toolInput.file_path) return `Edit(${toolInput.file_path})`;
+  if (toolName === 'Write' && toolInput.file_path) return `Write(${toolInput.file_path})`;
+  return toolName;
 }
 
 // --- フックハンドラ ---
@@ -798,9 +827,26 @@ async function hookPermissionRequest() {
     process.exit(0);
   }
 
-  // 排他ロック: 別の承認リクエストが処理中なら何もせず終了
-  if (!acquireLock('permission')) {
-    debugLog('hookPermissionRequest: SKIPPED - another permission request is already active');
+  // 排他ロック: 別の承認リクエストが処理中なら待機してリトライ（最大5分）
+  let lockAcquired = false;
+  for (let i = 0; i < 60; i++) {
+    if (acquireLock('permission')) { lockAcquired = true; break; }
+    if (i === 0) debugLog('hookPermissionRequest: waiting for lock...');
+    debugLog(`hookPermissionRequest: lock retry attempt ${i + 1}/60`);
+    await sleep(5000);
+  }
+  if (!lockAcquired) {
+    debugLog('hookPermissionRequest: SKIPPED - could not acquire lock after retries');
+    try {
+      const tool = input.tool_name || 'unknown';
+      await postMessage(config.slack_bot_token, config.channel_id,
+        `⏳ Permission: ${tool} がタイムアウトしました`,
+        [{
+          type: 'section',
+          text: { type: 'mrkdwn', text: `⏳ *Permission: ${tool}* の承認リクエストが待機タイムアウトしました。\nターミナルで回答してください。` }
+        }]
+      );
+    } catch {}
     process.exit(0);
   }
 
@@ -878,7 +924,7 @@ async function hookPermissionRequest() {
     { type: 'divider' },
     {
       type: 'section',
-      text: { type: 'mrkdwn', text: '✅ React to approve, ❌ to deny  —  or reply: *approve* / *deny*' }
+      text: { type: 'mrkdwn', text: '✅ approve  ❌ deny  🚀 always — or reply: *approve* / *deny* / *always*' }
     }
   ];
 
@@ -905,10 +951,16 @@ async function hookPermissionRequest() {
     debugLog(`hookPermissionRequest: decision=${decision} source=${approval.source} detail="${approval.detail}"`);
 
     // Claude Code のフックプロトコルに従い、承認/拒否を JSON で標準出力に返す
+    // allowAlways の場合は updatedPermissions を付与して「常に許可」を設定する
+    const behavior = decision === 'allowAlways' ? 'allow' : decision;
+    const decisionObj = { behavior };
+    if (decision === 'allowAlways') {
+      decisionObj.updatedPermissions = { allow: [buildPermissionRule(toolName, toolInput)] };
+    }
     const output = JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
-        decision: { behavior: decision }
+        decision: decisionObj
       }
     });
     debugLog(`hookPermissionRequest: output=${output}`);
@@ -953,8 +1005,26 @@ async function hookAskUserQuestion() {
     process.exit(0);
   }
 
-  if (!acquireLock('question')) {
-    debugLog('hookAskUserQuestion: SKIPPED - another question is already active');
+  // 排他ロック: 別の質問が処理中なら待機してリトライ（最大5分）
+  let lockAcquired = false;
+  for (let i = 0; i < 60; i++) {
+    if (acquireLock('question')) { lockAcquired = true; break; }
+    if (i === 0) debugLog('hookAskUserQuestion: waiting for lock...');
+    debugLog(`hookAskUserQuestion: lock retry attempt ${i + 1}/60`);
+    await sleep(5000);
+  }
+  if (!lockAcquired) {
+    debugLog('hookAskUserQuestion: SKIPPED - could not acquire lock after retries');
+    try {
+      const q = (input.tool_input?.questions?.[0]?.question || '').slice(0, 100);
+      await postMessage(config.slack_bot_token, config.channel_id,
+        '⏳ 質問がタイムアウトしました',
+        [{
+          type: 'section',
+          text: { type: 'mrkdwn', text: `⏳ *質問* が待機タイムアウトしました。\nターミナルで回答してください。${q ? `\n> ${q}` : ''}` }
+        }]
+      );
+    } catch {}
     process.exit(0);
   }
 
