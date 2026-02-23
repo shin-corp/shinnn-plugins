@@ -1,22 +1,35 @@
 #!/usr/bin/env node
 'use strict';
 
+/**
+ * claude-slack — Claude Code の承認リクエスト・質問・通知を Slack チャンネル経由で処理する CLI ツール
+ *
+ * 主な機能:
+ *   - PermissionRequest フック: ツール実行の承認/拒否を Slack のリアクションまたはスレッド返信で受け取る
+ *   - AskUserQuestion フック: Claude からの質問を Slack に転送し、スレッド返信で回答を受け取る
+ *   - Notification フック: Claude の回答を Slack に通知する
+ *   - CLI コマンド: enable/disable/config/test/status でセットアップと管理を行う
+ *
+ * 設定の優先度（高い順）: 環境変数 > プロジェクトローカル (.claude/claude-slack.local.md) > グローバル (~/.claude-slack/config.json)
+ */
+
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-// --- Paths ---
+// --- パス定義 ---
+// グローバル設定・状態・ログ・ロックファイルのパスを ~/.claude-slack/ 配下に集約
 const CONFIG_DIR = path.join(process.env.HOME, '.claude-slack');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
-const LOG_FILE = path.join(CONFIG_DIR, 'debug.log');
-const LOG_MAX_SIZE = 1024 * 1024; // 1MB
-const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');   // Slack トークンやチャンネル ID を保持
+const STATE_FILE = path.join(CONFIG_DIR, 'state.json');      // 有効/無効の状態を保持
+const LOG_FILE = path.join(CONFIG_DIR, 'debug.log');         // デバッグログの出力先
+const LOG_MAX_SIZE = 1024 * 1024; // ログファイルの最大サイズ (1MB)
+const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');        // 同時実行防止用ロックファイルの接頭辞
 
-// --- Signal Handlers ---
+// --- シグナルハンドラ ---
 // Claude Code がターミナルで応答を受けるとフックプロセスに SIGTERM/SIGINT を送る。
-// ロックファイルをクリーンアップしてから終了する。
+// プロセス終了前にロックファイルを削除して、次回の実行がブロックされないようにする。
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => {
     try { fs.unlinkSync(LOCK_FILE + '.permission'); } catch {}
@@ -25,20 +38,27 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   });
 }
 
-// --- Reaction Emoji Sets ---
+// --- リアクション絵文字の定義 ---
+// Slack メッセージへのリアクションで承認/拒否を判定するための絵文字セット
 const APPROVE_REACTIONS = new Set([
-  'white_check_mark', 'heavy_check_mark', 'thumbsup', '+1'
+  'white_check_mark', 'heavy_check_mark', 'thumbsup', '+1'  // ✅👍 = 承認
 ]);
 const DENY_REACTIONS = new Set([
-  'x', 'no_entry', 'thumbsdown', '-1'
+  'x', 'no_entry', 'thumbsdown', '-1'                        // ❌👎 = 拒否
 ]);
 
-// --- Debug Logging ---
+// --- デバッグログ ---
+
+/**
+ * ログファイルが最大サイズを超えた場合、後半部分のみ残して切り詰める。
+ * ファイル全体を読み込んで半分にカットする簡易ローテーション方式。
+ */
 function rotateLogIfNeeded() {
   try {
     const stat = fs.statSync(LOG_FILE);
     if (stat.size > LOG_MAX_SIZE) {
       const content = fs.readFileSync(LOG_FILE, 'utf8');
+      // 後半部分を取り出し、行の途中で切れないよう最初の改行以降を残す
       const half = content.slice(content.length >> 1);
       const firstNewline = half.indexOf('\n');
       fs.writeFileSync(LOG_FILE, firstNewline >= 0 ? half.slice(firstNewline + 1) : half);
@@ -46,8 +66,13 @@ function rotateLogIfNeeded() {
   } catch { /* ignore */ }
 }
 
+// ログローテーションはプロセスごとに1回だけ実行
 let _logRotated = false;
 
+/**
+ * タイムスタンプ付きでデバッグメッセージをログファイルに追記する。
+ * 最初の呼び出し時にログローテーションを実行する。
+ */
 function debugLog(msg) {
   try {
     if (!_logRotated) {
@@ -59,8 +84,13 @@ function debugLog(msg) {
   } catch { /* ignore */ }
 }
 
-// --- Utilities ---
+// --- ユーティリティ ---
 
+/**
+ * カレントディレクトリから親を辿り、プロジェクトローカル設定ファイルを探す。
+ * .claude/claude-slack.local.md が見つかればそのパスを返す。
+ * ファイルシステムのルートまで辿っても見つからなければ null を返す。
+ */
 function findProjectLocalConfig() {
   let dir = process.cwd();
   const root = path.parse(dir).root;
@@ -74,6 +104,11 @@ function findProjectLocalConfig() {
   return null;
 }
 
+/**
+ * Markdown ファイルの YAML フロントマター（--- で囲まれた部分）を簡易パースする。
+ * キー: 値 の形式を読み取り、文字列の引用符除去・boolean/number 変換を行う。
+ * 注意: 値にコロンを含む場合（例: URL）は正しくパースできない場合がある。
+ */
 function parseYamlFrontmatter(content) {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return {};
@@ -82,9 +117,11 @@ function parseYamlFrontmatter(content) {
     const kv = line.match(/^(\w+)\s*:\s*(.+)$/);
     if (kv) {
       let val = kv[2].trim();
+      // 引用符で囲まれている場合は除去
       if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
         val = val.slice(1, -1);
       }
+      // 型変換: boolean と整数
       if (val === 'true') val = true;
       else if (val === 'false') val = false;
       else if (/^\d+$/.test(val)) val = parseInt(val, 10);
@@ -94,8 +131,14 @@ function parseYamlFrontmatter(content) {
   return result;
 }
 
+/**
+ * 3層レイヤーの設定を読み込む。
+ * 優先度: 環境変数 > プロジェクトローカル > グローバル
+ * _source に各設定値がどのレイヤー由来かを記録する（status コマンドで表示用）。
+ * トークンもチャンネルも未設定の場合は null を返す。
+ */
 function loadConfig() {
-  // Layer 1: Global config (lowest priority)
+  // レイヤー1: グローバル設定（最低優先度）
   let config = { _source: {} };
   try {
     const global = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -103,9 +146,9 @@ function loadConfig() {
     if (global.channel_id) { config.channel_id = global.channel_id; config._source.channel_id = 'global'; }
     if (global.timeout) { config.timeout = global.timeout; config._source.timeout = 'global'; }
     if (global.anthropic_api_key) { config.anthropic_api_key = global.anthropic_api_key; config._source.anthropic_api_key = 'global'; }
-  } catch { /* no global config */ }
+  } catch { /* グローバル設定ファイルが存在しない場合は無視 */ }
 
-  // Layer 2: Project-local config (overrides global)
+  // レイヤー2: プロジェクトローカル設定（グローバルを上書き）
   const localPath = findProjectLocalConfig();
   if (localPath) {
     try {
@@ -117,19 +160,21 @@ function loadConfig() {
       if (local.anthropic_api_key) { config.anthropic_api_key = local.anthropic_api_key; config._source.anthropic_api_key = 'local'; }
       if (local.enabled !== undefined) { config._localEnabled = local.enabled; }
       config._localPath = localPath;
-    } catch { /* ignore parse errors */ }
+    } catch { /* パースエラーは無視 */ }
   }
 
-  // Layer 3: Environment variables (highest priority)
+  // レイヤー3: 環境変数（最高優先度）
   if (process.env.CLAUDE_SLACK_TOKEN) { config.slack_bot_token = process.env.CLAUDE_SLACK_TOKEN; config._source.slack_bot_token = 'env'; }
   if (process.env.CLAUDE_SLACK_CHANNEL) { config.channel_id = process.env.CLAUDE_SLACK_CHANNEL; config._source.channel_id = 'env'; }
   if (process.env.CLAUDE_SLACK_TIMEOUT) { config.timeout = parseInt(process.env.CLAUDE_SLACK_TIMEOUT, 10); config._source.timeout = 'env'; }
   if (process.env.ANTHROPIC_API_KEY) { config.anthropic_api_key = process.env.ANTHROPIC_API_KEY; config._source.anthropic_api_key = 'env'; }
 
+  // トークンもチャンネルも未設定なら設定なしとみなす
   if (!config.slack_bot_token && !config.channel_id) return null;
   return config;
 }
 
+/** グローバルの有効/無効状態を読み込む。ファイルがなければ無効として扱う。 */
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -138,19 +183,27 @@ function loadState() {
   }
 }
 
+/**
+ * claude-slack が有効かどうかを判定する。
+ * 優先度: 環境変数 CLAUDE_SLACK_ENABLED > プロジェクトローカル > グローバル state.json
+ */
 function isEnabled() {
-  // Env var overrides everything
+  // 環境変数が最優先
   if (process.env.CLAUDE_SLACK_ENABLED !== undefined) {
     return process.env.CLAUDE_SLACK_ENABLED === 'true' || process.env.CLAUDE_SLACK_ENABLED === '1';
   }
-  // Project-local overrides global
+  // プロジェクトローカルの設定がグローバルに優先
   const config = loadConfig();
   if (config?._localEnabled !== undefined) return config._localEnabled;
-  // Fall back to global state
+  // 最後にグローバル状態にフォールバック
   const state = loadState();
   return state.enabled;
 }
 
+/**
+ * プロジェクトローカル設定を .claude/claude-slack.local.md に YAML フロントマター形式で保存する。
+ * トークン等の機密情報を含むため、パーミッションを 600 に設定する。
+ */
 function saveLocalConfig(config) {
   const dir = path.join(process.cwd(), '.claude');
   fs.mkdirSync(dir, { recursive: true });
@@ -169,17 +222,20 @@ function saveLocalConfig(config) {
   fs.chmodSync(filePath, 0o600);
 }
 
+/** グローバルの有効/無効状態を state.json に保存する。 */
 function saveState(state) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
 }
 
+/** グローバル設定を config.json に保存する。機密情報を含むためパーミッション 600 に設定。 */
 function saveConfig(config) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
   fs.chmodSync(CONFIG_FILE, 0o600);
 }
 
+/** 標準入力を最後まで読み取って文字列として返す。フックの入力 JSON を受け取るために使用。 */
 function readStdin() {
   return new Promise((resolve) => {
     let data = '';
@@ -190,12 +246,17 @@ function readStdin() {
   });
 }
 
+/** 指定ミリ秒だけ待機する Promise を返す。ポーリング間隔の制御に使用。 */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- Input Validation ---
+// --- 入力バリデーション ---
 
+/**
+ * PermissionRequest フックの入力が有効かどうかを検証する。
+ * tool_name が文字列で存在し、エラーオブジェクトでないことを確認する。
+ */
 function isValidPermissionRequest(input) {
   if (!input || typeof input.tool_name !== 'string' || !input.tool_name) return false;
   if (input.type === 'error' || input.error) return false;
@@ -204,6 +265,10 @@ function isValidPermissionRequest(input) {
   return true;
 }
 
+/**
+ * AskUserQuestion フックの入力が有効かどうかを検証する。
+ * questions 配列が存在し、各要素に question 文字列があることを確認する。
+ */
 function isValidAskUserQuestion(input) {
   if (!input || input.type === 'error' || input.error) return false;
   const toolInput = input.tool_input || {};
@@ -211,6 +276,10 @@ function isValidAskUserQuestion(input) {
   return toolInput.questions.every(q => typeof q.question === 'string');
 }
 
+/**
+ * メッセージが API エラーかどうかを判定する。
+ * エラーメッセージを Slack に通知しないようフィルタリングするために使用。
+ */
 function isErrorMessage(message) {
   if (!message || typeof message !== 'string') return false;
   const errorPatterns = [
@@ -224,8 +293,23 @@ function isErrorMessage(message) {
   return errorPatterns.some(p => p.test(message));
 }
 
-// --- Concurrency Lock ---
+// --- 排他制御（ロック） ---
 
+/**
+ * 名前付きロックを取得する。同じ種類のフック（permission/question）が同時に動かないよう制御。
+ *
+ * 動作:
+ *   1. 既存のロックファイルがある場合、経過時間を確認
+ *   2. maxAgeMs 以内なら前のプロセスを SIGTERM で停止して引き継ぐ
+ *   3. ロックファイルを排他モード ('wx') で作成し、自分の PID を書き込む
+ *
+ * 注意: existsSync → unlinkSync → writeFileSync の間にわずかなレースコンディションの可能性があるが、
+ *       同一ユーザーのローカル環境での使用を前提としているため実用上問題ない。
+ *
+ * @param {string} lockName - ロック名（'permission' または 'question'）
+ * @param {number} maxAgeMs - ロックの最大有効期間（デフォルト: 2分）
+ * @returns {boolean} ロック取得に成功したら true
+ */
 function acquireLock(lockName, maxAgeMs = 120000) {
   const lockPath = LOCK_FILE + '.' + lockName;
   try {
@@ -233,17 +317,18 @@ function acquireLock(lockName, maxAgeMs = 120000) {
       const stat = fs.statSync(lockPath);
       const ageMs = Date.now() - stat.mtimeMs;
       if (ageMs < maxAgeMs) {
-        // 古いプロセスが生きていれば kill して引き継ぐ
+        // 前のプロセスが残っていれば終了させて引き継ぐ
         try {
           const oldPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
           if (oldPid && oldPid !== process.pid) {
             process.kill(oldPid, 'SIGTERM');
             debugLog(`acquireLock: killed stale process ${oldPid} for ${lockName}`);
           }
-        } catch { /* process already dead */ }
+        } catch { /* プロセスが既に終了している場合は無視 */ }
       }
       fs.unlinkSync(lockPath);
     }
+    // 排他モードでファイル作成（既にファイルがあれば失敗する）
     fs.writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
     return true;
   } catch {
@@ -251,26 +336,37 @@ function acquireLock(lockName, maxAgeMs = 120000) {
   }
 }
 
+/** ロックファイルを削除してロックを解放する。 */
 function releaseLock(lockName) {
   const lockPath = LOCK_FILE + '.' + lockName;
   try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
 }
 
+/** 文字列を最大長で切り詰める。Slack メッセージの文字数制限に対応するために使用。 */
 function truncate(str, max) {
   if (!str) return '';
   return str.length > max ? str.slice(0, max - 3) + '...' : str;
 }
 
+/**
+ * Slack メッセージに付与するプロジェクト情報（Git ブランチ名・プロジェクト名）を取得する。
+ * Git リポジトリでない場合はプロジェクト名のみ返す。
+ */
 function getProjectContext() {
   const parts = [];
   try {
     const branch = execSync('git rev-parse --abbrev-ref HEAD', { timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
     if (branch) parts.push(`Branch: \`${branch}\``);
-  } catch { /* not a git repo */ }
+  } catch { /* Git リポジトリでない場合は無視 */ }
   parts.push(`Project: \`${path.basename(process.cwd())}\``);
   return parts;
 }
 
+/**
+ * トランスクリプトファイル（JSONL 形式）から直近の会話履歴を抽出する。
+ * AI サマリー生成のコンテキストとして使用。
+ * 最新 maxLines 行を読み取り、Assistant/User/Tool の要約を最大10件返す。
+ */
 function getRecentTranscript(transcriptPath, maxLines = 30) {
   try {
     if (!transcriptPath) return '';
@@ -296,7 +392,7 @@ function getRecentTranscript(transcriptPath, maxLines = 30) {
             }
           }
         }
-      } catch { /* skip unparseable lines */ }
+      } catch { /* パースできない行はスキップ */ }
     }
     return parts.slice(-10).join('\n');
   } catch (e) {
@@ -305,6 +401,11 @@ function getRecentTranscript(transcriptPath, maxLines = 30) {
   }
 }
 
+/**
+ * Anthropic Messages API を呼び出して短いテキスト応答を得る。
+ * ツール実行の AI サマリー生成に使用。Haiku モデルで高速・低コストに処理する。
+ * エラー時は空文字列を返す（サマリーは任意機能のため、失敗しても処理を止めない）。
+ */
 function callAnthropic(apiKey, prompt, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
@@ -341,6 +442,11 @@ function callAnthropic(apiKey, prompt, timeoutMs = 5000) {
   });
 }
 
+/**
+ * ツール実行の内容を日本語1文で要約する（AI サマリー）。
+ * anthropic_api_key が設定されている場合のみ動作する任意機能。
+ * トランスクリプトから直近の会話コンテキストを取得し、「Claude が何をしようとしているか」を要約。
+ */
 async function generateSummary(config, toolName, toolInput, transcriptPath) {
   if (!config.anthropic_api_key) return '';
   const context = getRecentTranscript(transcriptPath);
@@ -362,8 +468,12 @@ What is Claude trying to do and why? Reply in one concise sentence in Japanese.`
   return summary.trim();
 }
 
-// --- Slack API ---
+// --- Slack API ラッパー ---
 
+/**
+ * Slack Web API を1回呼び出す。GET/POST に対応。
+ * レートリミット (429) の場合は _rateLimited フラグ付きのオブジェクトを返す。
+ */
 function slackRequestOnce(method, token, params, httpMethod = 'POST') {
   return new Promise((resolve, reject) => {
     let reqOptions;
@@ -414,6 +524,10 @@ function slackRequestOnce(method, token, params, httpMethod = 'POST') {
   });
 }
 
+/**
+ * Slack API をリトライ付きで呼び出す。
+ * レートリミットに遭遇した場合、Retry-After ヘッダーの秒数だけ待って最大3回リトライする。
+ */
 async function slackRequest(method, token, params, httpMethod = 'POST') {
   for (let attempt = 0; attempt < 3; attempt++) {
     const result = await slackRequestOnce(method, token, params, httpMethod);
@@ -426,6 +540,7 @@ async function slackRequest(method, token, params, httpMethod = 'POST') {
   throw new Error(`Slack API rate limited after 3 retries`);
 }
 
+/** Slack チャンネルにメッセージを投稿する。blocks を指定するとリッチメッセージになる。 */
 async function postMessage(token, channel, text, blocks) {
   const payload = { channel, text };
   if (blocks) payload.blocks = blocks;
@@ -434,6 +549,7 @@ async function postMessage(token, channel, text, blocks) {
   return result;
 }
 
+/** 指定メッセージ (ts) のスレッド返信を取得する。最新10件まで。 */
 async function getThreadReplies(token, channel, ts) {
   const result = await slackRequest('conversations.replies', token, {
     channel, ts, limit: '10'
@@ -442,6 +558,7 @@ async function getThreadReplies(token, channel, ts) {
   return result.messages || [];
 }
 
+/** 指定メッセージ (ts) に付けられたリアクション一覧を取得する。 */
 async function getReactions(token, channel, ts) {
   const result = await slackRequest('reactions.get', token, {
     channel, timestamp: ts, full: 'true'
@@ -453,6 +570,13 @@ async function getReactions(token, channel, ts) {
   return (result.message && result.message.reactions) || [];
 }
 
+/**
+ * Slack のスレッド返信をポーリングして、人間の返信テキストを待つ。
+ * AskUserQuestion フック用。
+ *
+ * ポーリング間隔: 最初の1分は5秒、その後は10秒に緩和する。
+ * タイムアウトすると null を返し、ローカルプロンプトにフォールバックする。
+ */
 async function pollForReply(token, channel, ts, timeoutMs = 300000) {
   const startTime = Date.now();
   let interval = 5000;
@@ -466,9 +590,11 @@ async function pollForReply(token, channel, ts, timeoutMs = 300000) {
 
     try {
       const messages = await getThreadReplies(token, channel, ts);
+      // ボットの返信を除外し、人間の返信のみを取得
       const replies = messages.filter(m => m.ts !== ts && !m.bot_id);
       debugLog(`pollForReply: poll #${pollCount} - ${messages.length} messages, ${replies.length} human replies`);
       if (replies.length > 0) {
+        // 最新の返信を使用
         const replyText = replies[replies.length - 1].text;
         debugLog(`pollForReply: got reply: "${replyText}"`);
         return replyText;
@@ -477,6 +603,7 @@ async function pollForReply(token, channel, ts, timeoutMs = 300000) {
       debugLog(`pollForReply: poll #${pollCount} error: ${e.message}`);
     }
 
+    // 1分経過後はポーリング間隔を広げて API 負荷を軽減
     if (Date.now() - startTime > 60000 && interval < 10000) {
       interval = 10000;
     }
@@ -486,6 +613,18 @@ async function pollForReply(token, channel, ts, timeoutMs = 300000) {
   return null;
 }
 
+/**
+ * Slack のリアクションとスレッド返信をポーリングして、承認/拒否の判断を待つ。
+ * PermissionRequest フック用。
+ *
+ * 判定方法:
+ *   - リアクション: ✅/👍 = 承認、❌/👎 = 拒否（毎回チェック）
+ *   - スレッド返信: "approve/allow/yes/y/ok" で始まれば承認、それ以外は拒否（3回に1回チェック）
+ *
+ * ポーリング間隔: 最初の1分は5秒、その後は10秒に緩和。
+ * スレッド返信のチェック頻度が低いのは、conversations.replies が Tier 1 のレートリミットのため。
+ * タイムアウトすると null を返す。
+ */
 async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
   const startTime = Date.now();
   let interval = 5000;
@@ -497,7 +636,7 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
     await sleep(interval);
     pollCount++;
 
-    // Check reactions (every cycle - Tier 2+ rate limit)
+    // リアクションを毎回チェック（reactions.get は Tier 2+ で比較的余裕がある）
     try {
       const reactions = await getReactions(token, channel, ts);
       for (const r of reactions) {
@@ -514,7 +653,7 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
       debugLog(`pollForApproval: reaction check #${pollCount} error: ${e.message}`);
     }
 
-    // Check thread replies (every 3rd cycle - Tier 1 rate limit)
+    // スレッド返信は3回に1回チェック（conversations.replies は Tier 1 でレートリミットが厳しい）
     if (pollCount % 3 === 0) {
       try {
         const messages = await getThreadReplies(token, channel, ts);
@@ -523,6 +662,7 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
         if (replies.length > 0) {
           const replyText = replies[replies.length - 1].text;
           const replyLower = replyText.toLowerCase().trim();
+          // "approve", "allow", "yes", "y", "ok" で始まれば承認、それ以外は拒否
           const isApproved = /^(approve|allow|yes|y|ok)/.test(replyLower);
           const decision = isApproved ? 'allow' : 'deny';
           debugLog(`pollForApproval: ${decision} via thread reply: "${replyText}"`);
@@ -533,6 +673,7 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
       }
     }
 
+    // 1分経過後はポーリング間隔を広げて API 負荷を軽減
     if (Date.now() - startTime > 60000 && interval < 10000) {
       interval = 10000;
     }
@@ -542,8 +683,21 @@ async function pollForApproval(token, channel, ts, timeoutMs = 300000) {
   return null;
 }
 
-// --- Hook Handlers ---
+// --- フックハンドラ ---
 
+/**
+ * PermissionRequest フックハンドラ。
+ * Claude Code がツール実行の承認を求める際に呼び出される。
+ *
+ * 処理フロー:
+ *   1. 有効性チェック・設定読み込み・標準入力パース
+ *   2. ロック取得（同時に複数の承認リクエストが走らないよう制御）
+ *   3. ツール種別に応じた詳細情報を構築（Bash/Write/Edit/その他）
+ *   4. AI サマリー生成（任意）
+ *   5. Slack にメッセージ投稿
+ *   6. リアクションまたはスレッド返信をポーリングして承認/拒否を取得
+ *   7. 結果を JSON で標準出力に返す
+ */
 async function hookPermissionRequest() {
   debugLog('hookPermissionRequest: start');
   if (!isEnabled()) { debugLog('hookPermissionRequest: disabled, exit'); process.exit(0); }
@@ -551,6 +705,7 @@ async function hookPermissionRequest() {
   const config = loadConfig();
   if (!config?.slack_bot_token || !config?.channel_id) { debugLog('hookPermissionRequest: no config, exit'); process.exit(0); }
 
+  // 標準入力から Claude Code が渡すフック入力 JSON を読み取る
   let input;
   try {
     const raw = await readStdin();
@@ -561,11 +716,13 @@ async function hookPermissionRequest() {
     process.exit(0);
   }
 
+  // 入力バリデーション: エラーオブジェクトや不正な入力は無視
   if (!isValidPermissionRequest(input)) {
     debugLog(`hookPermissionRequest: REJECTED invalid input: ${JSON.stringify(input).slice(0, 200)}`);
     process.exit(0);
   }
 
+  // 排他ロック: 別の承認リクエストが処理中なら何もせず終了
   if (!acquireLock('permission')) {
     debugLog('hookPermissionRequest: SKIPPED - another permission request is already active');
     process.exit(0);
@@ -575,10 +732,12 @@ async function hookPermissionRequest() {
   const toolInput = input.tool_input || {};
   const sessionId = input.session_id || 'unknown';
 
+  // ツール種別ごとに Slack に表示する詳細情報を構築
   let details = '';
   let warn = '';
   if (toolName === 'Bash') {
     const cmd = toolInput.command || '';
+    // 危険なコマンドパターンの検出（rm -r, sudo, git push --force 等）
     const dangerPatterns = [
       /rm\s+(-[^\s]*r|--recursive)/, /sudo\s/, /chmod\s+777/,
       /git\s+(push\s+(-f|--force)|reset\s+--hard|clean\s+-f)/,
@@ -591,6 +750,7 @@ async function hookPermissionRequest() {
       details += `\n*Description:* ${truncate(toolInput.description, 200)}`;
     }
   } else if (toolName === 'Write') {
+    // ファイル書き込み: パス、サイズ、先頭10行のプレビューを表示
     const content = toolInput.content || '';
     const lines = content.split('\n');
     details = `*File:* \`${toolInput.file_path || ''}\`\n*Size:* ${content.length} chars, ${lines.length} lines`;
@@ -600,6 +760,7 @@ async function hookPermissionRequest() {
     }
     if (lines.length > 10) details += `\n_...and ${lines.length - 10} more lines_`;
   } else if (toolName === 'Edit') {
+    // ファイル編集: パス、置換前/後のテキストを表示
     details = `*File:* \`${toolInput.file_path || ''}\``;
     if (toolInput.old_string) {
       details += `\n*Replace:*\n\`\`\`${truncate(toolInput.old_string, 800)}\`\`\``;
@@ -609,13 +770,15 @@ async function hookPermissionRequest() {
     }
     if (toolInput.replace_all) details += `\n:warning: *replace_all: true*`;
   } else {
+    // その他のツール: JSON をそのまま表示
     const inputStr = JSON.stringify(toolInput, null, 2);
     details = `\`\`\`${truncate(inputStr, 2500)}\`\`\``;
   }
 
-  // AI summary (optional - requires anthropic_api_key)
+  // AI サマリー（任意: anthropic_api_key が設定されている場合のみ）
   const summary = await generateSummary(config, toolName, toolInput, input.transcript_path);
 
+  // Slack Block Kit メッセージの構築
   const contextElements = [
     { type: 'mrkdwn', text: `Session: \`${sessionId.slice(0, 8)}\`` },
     ...getProjectContext().map(text => ({ type: 'mrkdwn', text }))
@@ -646,17 +809,20 @@ async function hookPermissionRequest() {
   ];
 
   try {
+    // Slack にパーミッションリクエストを投稿
     const result = await postMessage(
       config.slack_bot_token, config.channel_id,
       `Permission Request: ${toolName}`, blocks
     );
 
+    // 承認/拒否の応答をポーリングで待つ
     const approval = await pollForApproval(
       config.slack_bot_token, config.channel_id,
       result.ts, (config.timeout || 300) * 1000
     );
 
     if (!approval) {
+      // タイムアウト: 何も出力せずに終了し、ローカルのターミナルプロンプトにフォールバック
       debugLog('hookPermissionRequest: timed out, falling back to local prompt');
       process.exit(0);
     }
@@ -664,6 +830,7 @@ async function hookPermissionRequest() {
     const decision = approval.decision;
     debugLog(`hookPermissionRequest: decision=${decision} source=${approval.source} detail="${approval.detail}"`);
 
+    // Claude Code のフックプロトコルに従い、承認/拒否を JSON で標準出力に返す
     const output = JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
@@ -679,6 +846,17 @@ async function hookPermissionRequest() {
   }
 }
 
+/**
+ * AskUserQuestion フックハンドラ。
+ * Claude Code がユーザーに質問する際に呼び出される。
+ *
+ * 処理フロー:
+ *   1. 質問内容を Slack にフォーマットして投稿（選択肢がある場合は番号付きリスト）
+ *   2. スレッド返信をポーリングして回答を待つ
+ *   3. 番号で回答された場合は対応する選択肢のラベルに変換
+ *   4. PreToolUse の deny として出力し、additionalContext にユーザーの回答を載せる
+ *      （これにより Claude は同じ質問を再度表示せず、Slack の回答を利用して続行する）
+ */
 async function hookAskUserQuestion() {
   debugLog('hookAskUserQuestion: start');
   if (!isEnabled()) { debugLog('hookAskUserQuestion: disabled, exit'); process.exit(0); }
@@ -710,6 +888,7 @@ async function hookAskUserQuestion() {
   const sessionId = input.session_id || 'unknown';
   const questions = toolInput.questions || [];
 
+  // 質問テキストを Slack mrkdwn 形式で構築（選択肢がある場合は番号付きリスト）
   let questionText = '';
   for (const q of questions) {
     questionText += `*${q.question}*\n`;
@@ -752,6 +931,7 @@ async function hookAskUserQuestion() {
       '❓ Claude needs your input', blocks
     );
 
+    // スレッド返信をポーリングして回答を待つ
     const reply = await pollForReply(
       config.slack_bot_token, config.channel_id,
       result.ts, (config.timeout || 300) * 1000
@@ -762,6 +942,7 @@ async function hookAskUserQuestion() {
       process.exit(0);
     }
 
+    // 番号で回答された場合、対応する選択肢のラベルに変換
     let answer = reply.trim();
     const num = parseInt(answer, 10);
     if (!isNaN(num) && questions[0]?.options) {
@@ -771,6 +952,9 @@ async function hookAskUserQuestion() {
 
     debugLog(`hookAskUserQuestion: reply="${reply}" answer="${answer}"`);
 
+    // PreToolUse の deny として出力し、Slack の回答を additionalContext に載せる
+    // これにより Claude は AskUserQuestion ツールの実行を中止し、
+    // 提供された回答をもとに処理を続行する
     const output = JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
@@ -788,12 +972,17 @@ async function hookAskUserQuestion() {
   }
 }
 
+/**
+ * トランスクリプトファイルから Claude の最新の応答テキストを取得する。
+ * Notification フックで Slack に Claude の回答を表示するために使用。
+ * JSONL 形式のトランスクリプトを末尾から走査し、最初に見つかった assistant メッセージを返す。
+ */
 async function getLastAssistantMessage(transcriptPath) {
   if (!transcriptPath) return null;
   try {
     const content = fs.readFileSync(transcriptPath, 'utf8');
     const lines = content.trim().split('\n');
-    // 末尾から assistant の text メッセージを探す
+    // 末尾から走査して最新の assistant テキストメッセージを探す
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const entry = JSON.parse(lines[i]);
@@ -811,6 +1000,17 @@ async function getLastAssistantMessage(transcriptPath) {
   return null;
 }
 
+/**
+ * Notification フックハンドラ。
+ * Claude Code がアイドル状態になった際や応答を完了した際に呼び出される。
+ *
+ * 処理フロー:
+ *   1. トランスクリプトから Claude の最新の応答を取得
+ *   2. 応答があればその内容を、なければ通知メッセージを Slack に投稿
+ *   3. 一方通行の通知のため、投稿後すぐにプロセスを終了（ポーリングなし）
+ *
+ * エラーメッセージ（API エラー等）は Slack に通知しないようフィルタリングする。
+ */
 async function hookNotification() {
   debugLog('hookNotification: start');
   if (!isEnabled()) { debugLog('hookNotification: disabled, exit'); process.exit(0); }
@@ -828,6 +1028,7 @@ async function hookNotification() {
     process.exit(0);
   }
 
+  // エラーオブジェクトは通知対象外
   if (input.type === 'error' || input.error) {
     debugLog(`hookNotification: REJECTED error object: ${JSON.stringify(input).slice(0, 200)}`);
     process.exit(0);
@@ -836,12 +1037,13 @@ async function hookNotification() {
   const sessionId = input.session_id || 'unknown';
   const message = input.message || 'Claude Code is waiting for input';
 
+  // API エラーメッセージは通知対象外
   if (isErrorMessage(message)) {
     debugLog(`hookNotification: REJECTED error message: ${message.slice(0, 200)}`);
     process.exit(0);
   }
 
-  // transcript から Claude の最後の回答を取得
+  // トランスクリプトから Claude の最新の回答を取得
   const lastMessage = await getLastAssistantMessage(input.transcript_path);
   debugLog(`hookNotification: lastMessage length=${lastMessage?.length || 0}`);
 
@@ -895,8 +1097,9 @@ async function hookNotification() {
   process.exit(0);
 }
 
-// --- CLI Commands ---
+// --- CLI コマンド ---
 
+/** Slack 連携を有効にする。--local でプロジェクトローカル、なしでグローバル。 */
 async function cmdEnable(args) {
   const isLocal = args.includes('--local');
   if (isLocal) {
@@ -909,6 +1112,7 @@ async function cmdEnable(args) {
   }
 }
 
+/** Slack 連携を無効にする。--local でプロジェクトローカル、なしでグローバル。 */
 async function cmdDisable(args) {
   const isLocal = args.includes('--local');
   if (isLocal) {
@@ -921,6 +1125,11 @@ async function cmdDisable(args) {
   }
 }
 
+/**
+ * Slack トークン・チャンネル ID・タイムアウト等を設定する。
+ * --local でプロジェクトローカル、なしでグローバル設定に保存。
+ * 引数なしの場合はヘルプを表示。
+ */
 async function cmdConfig(args) {
   const isLocal = args.includes('--local');
   const filteredArgs = args.filter(a => a !== '--local');
@@ -977,6 +1186,7 @@ async function cmdConfig(args) {
   console.log(`  Timeout:  ${config.timeout || 300}s`);
 }
 
+/** Slack 接続テスト。設定済みのチャンネルにテストメッセージを投稿して動作確認する。 */
 async function cmdTest() {
   const config = loadConfig();
   if (!config?.slack_bot_token || !config?.channel_id) {
@@ -1003,11 +1213,12 @@ async function cmdTest() {
   }
 }
 
+/** 現在の設定状態を表示する。各設定値の出所（global/local/env）も表示。 */
 async function cmdStatus() {
   const enabled = isEnabled();
   const config = loadConfig();
 
-  // Determine enabled source
+  // 有効/無効の状態がどのレイヤーで決まっているかを判定
   let enabledSource = 'global';
   if (process.env.CLAUDE_SLACK_ENABLED !== undefined) enabledSource = 'env';
   else if (config?._localEnabled !== undefined) enabledSource = 'local';
@@ -1029,8 +1240,24 @@ async function cmdStatus() {
   }
 }
 
-// --- Main ---
+// --- メインエントリーポイント ---
 
+/**
+ * CLI のエントリーポイント。
+ * コマンドライン引数に応じてフックハンドラまたは CLI コマンドを実行する。
+ *
+ * フック:
+ *   claude-slack hook permission-request  — PermissionRequest フック
+ *   claude-slack hook ask-user-question   — AskUserQuestion フック
+ *   claude-slack hook notification        — Notification フック
+ *
+ * CLI コマンド:
+ *   claude-slack enable [--local]   — 有効化
+ *   claude-slack disable [--local]  — 無効化
+ *   claude-slack config [--local]   — 設定
+ *   claude-slack test               — 接続テスト
+ *   claude-slack status             — 状態表示
+ */
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -1038,6 +1265,7 @@ async function main() {
   try {
     switch (command) {
       case 'hook':
+        // フックハンドラ: Claude Code のフックイベントから呼び出される
         switch (args[1]) {
           case 'permission-request': await hookPermissionRequest(); break;
           case 'ask-user-question':  await hookAskUserQuestion(); break;
