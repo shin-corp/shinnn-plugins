@@ -348,37 +348,39 @@ fi
 
 
 # ===================================================================
-# TEST 5: Concurrent lock - second permission-request is SKIPPED
+# TEST 5: Concurrent lock - second permission-request retries
 # ===================================================================
 if should_run 5; then
   separator
-  echo -e "${CYAN}TEST 5: Concurrent lock -> second process SKIPPED (no Slack post)${NC}"
-  echo -e "  Strategy: manually create the lock file, then run a permission-request."
-  echo -e "  The lock will cause it to skip without posting."
+  echo -e "${CYAN}TEST 5: Concurrent lock -> second process retries (no Slack post)${NC}"
+  echo -e "  Strategy: create a directory where the lock file should be,"
+  echo -e "  making acquireLock fail reliably. Verify retry log messages."
   log_marker "TEST5"
   cleanup_locks
 
-  # Manually create the permission lock to simulate another process holding it
-  echo "99999" > "$LOCK_DIR/hook.lock.permission"
-  # Touch it so it is fresh (not stale)
-  touch "$LOCK_DIR/hook.lock.permission"
+  # Create a directory at the lock path — acquireLock cannot unlink or
+  # overwrite a directory, so it reliably returns false on every attempt.
+  mkdir -p "$LOCK_DIR/hook.lock.permission"
 
   EXIT_CODE=0
   echo '{
     "tool_name": "Bash",
     "tool_input": {"command": "echo concurrent-test"},
     "session_id": "test-hook-00000005"
-  }' | node "$SCRIPT" hook permission-request 2>&1 || EXIT_CODE=$?
+  }' | timeout 12 node "$SCRIPT" hook permission-request 2>&1 || EXIT_CODE=$?
 
   sleep 0.5
 
-  assert_exit_code "$EXIT_CODE" 0 \
-    "Exited cleanly (exit 0)"
+  # Clean up the directory
+  rmdir "$LOCK_DIR/hook.lock.permission" 2>/dev/null || rm -rf "$LOCK_DIR/hook.lock.permission"
+
   assert_log_contains "TEST5" "hookPermissionRequest: start" \
     "Handler started"
-  assert_log_contains "TEST5" "SKIPPED.*another permission request is already active" \
-    "Skipped due to lock contention"
-  assert_log_not_contains "TEST5" "pollForReply" \
+  assert_log_contains "TEST5" "waiting for lock" \
+    "Retry mechanism triggered"
+  assert_log_contains "TEST5" "lock retry attempt" \
+    "At least one retry attempt logged"
+  assert_log_not_contains "TEST5" "pollForApproval" \
     "No Slack post was attempted"
 
   cleanup_locks
