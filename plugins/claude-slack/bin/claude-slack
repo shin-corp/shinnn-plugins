@@ -14,6 +14,17 @@ const LOG_FILE = path.join(CONFIG_DIR, 'debug.log');
 const LOG_MAX_SIZE = 1024 * 1024; // 1MB
 const LOCK_FILE = path.join(CONFIG_DIR, 'hook.lock');
 
+// --- Signal Handlers ---
+// Claude Code がターミナルで応答を受けるとフックプロセスに SIGTERM/SIGINT を送る。
+// ロックファイルをクリーンアップしてから終了する。
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => {
+    try { fs.unlinkSync(LOCK_FILE + '.permission'); } catch {}
+    try { fs.unlinkSync(LOCK_FILE + '.question'); } catch {}
+    process.exit(0);
+  });
+}
+
 // --- Reaction Emoji Sets ---
 const APPROVE_REACTIONS = new Set([
   'white_check_mark', 'heavy_check_mark', 'thumbsup', '+1'
@@ -222,7 +233,14 @@ function acquireLock(lockName, maxAgeMs = 120000) {
       const stat = fs.statSync(lockPath);
       const ageMs = Date.now() - stat.mtimeMs;
       if (ageMs < maxAgeMs) {
-        return false;
+        // 古いプロセスが生きていれば kill して引き継ぐ
+        try {
+          const oldPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+          if (oldPid && oldPid !== process.pid) {
+            process.kill(oldPid, 'SIGTERM');
+            debugLog(`acquireLock: killed stale process ${oldPid} for ${lockName}`);
+          }
+        } catch { /* process already dead */ }
       }
       fs.unlinkSync(lockPath);
     }
@@ -770,6 +788,29 @@ async function hookAskUserQuestion() {
   }
 }
 
+async function getLastAssistantMessage(transcriptPath) {
+  if (!transcriptPath) return null;
+  try {
+    const content = fs.readFileSync(transcriptPath, 'utf8');
+    const lines = content.trim().split('\n');
+    // 末尾から assistant の text メッセージを探す
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.message?.role === 'assistant' && Array.isArray(entry.message.content)) {
+          const textParts = entry.message.content
+            .filter(c => c.type === 'text' && c.text)
+            .map(c => c.text);
+          if (textParts.length > 0) return textParts.join('\n');
+        }
+      } catch { /* skip malformed lines */ }
+    }
+  } catch (e) {
+    debugLog(`getLastAssistantMessage: error reading transcript: ${e?.message}`);
+  }
+  return null;
+}
+
 async function hookNotification() {
   debugLog('hookNotification: start');
   if (!isEnabled()) { debugLog('hookNotification: disabled, exit'); process.exit(0); }
@@ -800,19 +841,51 @@ async function hookNotification() {
     process.exit(0);
   }
 
-  debugLog(`hookNotification: posting message: ${message.slice(0, 100)}`);
+  // transcript から Claude の最後の回答を取得
+  const lastMessage = await getLastAssistantMessage(input.transcript_path);
+  debugLog(`hookNotification: lastMessage length=${lastMessage?.length || 0}`);
+
+  const blocks = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: '💬 Claude Code からの回答' }
+    }
+  ];
+
+  if (lastMessage) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: truncate(lastMessage, 2500) }
+    });
+  } else {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `⏳ ${truncate(message, 2500)}` }
+    });
+  }
+
+  const projectName = input.cwd ? path.basename(input.cwd) : '';
+  const contextParts = [`Session: \`${sessionId.slice(0, 8)}\``];
+  if (projectName) contextParts.push(`Project: \`${projectName}\``);
+
+  blocks.push(
+    { type: 'divider' },
+    {
+      type: 'context',
+      elements: [
+        { type: 'mrkdwn', text: contextParts.join('  |  ') },
+        { type: 'mrkdwn', text: 'ℹ️ この回答への返信は Slack からはできません。ターミナルで入力してください。' }
+      ]
+    }
+  );
+
+  debugLog(`hookNotification: posting message with ${lastMessage ? 'assistant response' : 'fallback'}`);
 
   try {
     await postMessage(
       config.slack_bot_token, config.channel_id,
-      `⏳ ${message}`,
-      [{
-        type: 'section',
-        text: { type: 'mrkdwn', text: `⏳ *Claude Code is idle and waiting for your input*\n${truncate(message, 2500)}` }
-      }, {
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: `Session: \`${sessionId.slice(0, 8)}\`` }]
-      }]
+      lastMessage ? '💬 Claude Code からの回答があります' : `⏳ ${message}`,
+      blocks
     );
     debugLog('hookNotification: posted successfully');
   } catch (e) {
