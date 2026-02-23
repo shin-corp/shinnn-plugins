@@ -1,7 +1,7 @@
 {
   "name": "claude-slack",
   "description": "Route Claude Code permission requests, questions, and notifications to Slack",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "shinnn, Inc."
   },
