@@ -349,6 +349,82 @@ function truncate(str, max) {
 }
 
 /**
+ * 2つの文字列から unified diff 風の差分テキストを生成する。
+ * Myers diff アルゴリズム（O(ND)）で最短編集距離を求め、共通行/ 追加行 / 削除行を出力する。
+ * npm 依存なしで行レベルの diff を実現するために自前実装。
+ */
+function generateLineDiff(oldStr, newStr) {
+  const oldLines = (oldStr || '').split('\n');
+  const newLines = (newStr || '').split('\n');
+  const N = oldLines.length;
+  const M = newLines.length;
+
+  // Myers diff: 最短編集パスを求める
+  const max = N + M;
+  const v = new Int32Array(2 * max + 1);
+  v[max + 1] = 0;
+  const trace = [];
+
+  outer:
+  for (let d = 0; d <= max; d++) {
+    trace.push(Int32Array.from(v));
+    for (let k = -d; k <= d; k += 2) {
+      let x;
+      if (k === -d || (k !== d && v[max + k - 1] < v[max + k + 1])) {
+        x = v[max + k + 1];     // 下に移動（挿入）
+      } else {
+        x = v[max + k - 1] + 1; // 右に移動（削除）
+      }
+      let y = x - k;
+      // 対角線を進む（共通行）
+      while (x < N && y < M && oldLines[x] === newLines[y]) {
+        x++; y++;
+      }
+      v[max + k] = x;
+      if (x >= N && y >= M) break outer;
+    }
+  }
+
+  // トレースバックで編集操作を復元
+  // trace[d] はステップ d の処理「前」の v のスナップショット（= ステップ d-1 処理後の状態）
+  // したがって、ステップ d-1 の状態は trace[d] で参照する
+  const ops = [];
+  let x = N, y = M;
+  for (let d = trace.length - 1; d > 0; d--) {
+    const prev = trace[d];
+    const k = x - y;
+    let prevK;
+    if (k === -d || (k !== d && prev[max + k - 1] < prev[max + k + 1])) {
+      prevK = k + 1; // 挿入だった
+    } else {
+      prevK = k - 1; // 削除だった
+    }
+    const prevX = prev[max + prevK];
+    const prevY = prevX - prevK;
+    // 対角線（共通行）を逆方向に辿る
+    while (x > prevX && y > prevY) {
+      x--; y--;
+      ops.push({ type: ' ', line: oldLines[x] });
+    }
+    if (x > prevX) {
+      x--;
+      ops.push({ type: '-', line: oldLines[x] });
+    } else if (y > prevY) {
+      y--;
+      ops.push({ type: '+', line: newLines[y] });
+    }
+  }
+  // 残りの対角線
+  while (x > 0 && y > 0) {
+    x--; y--;
+    ops.push({ type: ' ', line: oldLines[x] });
+  }
+  ops.reverse();
+
+  return ops.map(op => `${op.type} ${op.line}`).join('\n');
+}
+
+/**
  * Slack メッセージに付与するプロジェクト情報（Git ブランチ名・プロジェクト名）を取得する。
  * Git リポジトリでない場合はプロジェクト名のみ返す。
  */
@@ -760,13 +836,11 @@ async function hookPermissionRequest() {
     }
     if (lines.length > 10) details += `\n_...and ${lines.length - 10} more lines_`;
   } else if (toolName === 'Edit') {
-    // ファイル編集: パス、置換前/後のテキストを表示
+    // ファイル編集: パスと diff 形式の差分を表示
     details = `*File:* \`${toolInput.file_path || ''}\``;
-    if (toolInput.old_string) {
-      details += `\n*Replace:*\n\`\`\`${truncate(toolInput.old_string, 800)}\`\`\``;
-    }
-    if (toolInput.new_string) {
-      details += `\n*With:*\n\`\`\`${truncate(toolInput.new_string, 800)}\`\`\``;
+    if (toolInput.old_string || toolInput.new_string) {
+      const diff = generateLineDiff(toolInput.old_string || '', toolInput.new_string || '');
+      details += `\n*Diff:*\n\`\`\`diff\n${truncate(diff, 2000)}\`\`\``;
     }
     if (toolInput.replace_all) details += `\n:warning: *replace_all: true*`;
   } else {
